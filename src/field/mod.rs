@@ -172,6 +172,13 @@ pub(crate) enum DeletionFlag {
 }
 
 impl DeletionFlag {
+    pub(crate) const fn to_byte(self) -> u8 {
+        match self {
+            Self::NotDeleted => 0x20,
+            Self::Deleted => 0x2A,
+        }
+    }
+
     pub(crate) fn read_from<T: Read>(source: &mut T) -> std::io::Result<Self> {
         let byte = source.read_u8()?;
         match byte {

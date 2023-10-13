@@ -252,7 +252,7 @@ impl TableWriterBuilder {
         let size_of_record = self
             .v
             .iter()
-            .fold(1u16, |s, info| s + info.field_length as u16);
+            .fold(0u16, |s, info| s + info.field_length as u16);
 
         self.hdr.offset_to_first_record = offset_to_first_record as u16;
         self.hdr.size_of_record = size_of_record;
