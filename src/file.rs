@@ -1,7 +1,8 @@
 use crate::encoding::DynEncoding;
 use crate::field::types::TrimOption;
-use crate::field::{DeletionFlag, DELETION_FLAG_SIZE};
+use crate::field::{DeletionFlag, FieldsInfo, DELETION_FLAG_SIZE};
 use crate::header::Header;
+use crate::memo::MemoReader;
 use crate::reading::{ReadingOptions, BACKLINK_SIZE, TERMINATOR_VALUE};
 use crate::writing::{write_header_parts, WritableAsDbaseField};
 use crate::ErrorKind::UnsupportedCodePage;
@@ -85,12 +86,20 @@ impl<'a, T> FieldRef<'a, T> {
             .header
             .record_position(self.record_index.0)
             .unwrap() as u64;
-        let position_in_record = self.file.fields_info[..self.field_index.0]
-            .iter()
-            .map(|i| i.field_length as u64)
-            .sum::<u64>();
+        let position_in_record = self.position_in_record();
 
-        record_position + position_in_record
+        record_position + position_in_record as u64
+    }
+
+    /// Returns the start position in the record **INCLUDING**
+    /// the deletion flag
+    fn position_in_record(&self) -> usize {
+        DELETION_FLAG_SIZE
+            + self
+                .file
+                .fields_info
+                .field_position_in_record(self.field_index.0)
+                .expect("internal error, invalid field index in FieldRef")
     }
 }
 
@@ -98,23 +107,13 @@ impl<'a, T> FieldRef<'a, T>
 where
     T: Seek,
 {
-    pub(crate) fn seek_to_beginning(&mut self) -> Result<u64, FieldIOError> {
+    fn seek_to_beginning(&mut self) -> Result<u64, FieldIOError> {
         let field_info = &self.file.fields_info[self.field_index.0];
 
         self.file
             .inner
             .seek(SeekFrom::Start(self.position_in_source()))
             .map_err(|e| FieldIOError::new(ErrorKind::IoError(e), Some(field_info.clone())))
-    }
-
-    /// Returns the start position in the record **INCLUDING**
-    /// the deletion flag
-    fn position_in_record(&self) -> usize {
-        DELETION_FLAG_SIZE
-            + self.file.fields_info[..self.field_index.0]
-                .iter()
-                .map(|i| i.field_length as usize)
-                .sum::<usize>()
     }
 }
 
@@ -130,9 +129,9 @@ where
         let field_bytes = &mut self.file.record_data_buffer.get_mut()
             [start_pos..start_pos + field_info.field_length as usize];
 
-        FieldValue::read_from::<Cursor<Vec<u8>>, _>(
+        FieldValue::read_from(
             &field_bytes,
-            &mut None,
+            &mut self.file.memo_reader,
             field_info,
             &self.file.encoding,
             TrimOption::BeginEnd,
@@ -253,14 +252,7 @@ impl<'a, T> RecordRef<'a, T>
 where
     T: Seek,
 {
-    pub fn seek_to_beginning(&mut self) -> Result<u64, FieldIOError> {
-        self.file
-            .inner
-            .seek(SeekFrom::Start(self.position_in_source()))
-            .map_err(|e| FieldIOError::new(ErrorKind::IoError(e), None))
-    }
-
-    pub fn seek_before_deletion_flag(&mut self) -> Result<u64, FieldIOError> {
+    fn seek_before_deletion_flag(&mut self) -> Result<u64, FieldIOError> {
         self.file
             .inner
             .seek(SeekFrom::Start(
@@ -278,31 +270,29 @@ where
     ///
     /// - true -> the record is marked as deleted
     /// - false -> the record is **not** marked as deleted
-    pub fn is_deleted(&mut self) -> Result<bool, Error> {
-        let deletion_flag = DeletionFlag::read_from(&mut self.file.record_data_buffer)
-            .map_err(|error| Error::io_error(error, self.index.0))?;
+    pub fn is_deleted(&self) -> Result<bool, Error> {
+        let deletion_flag = DeletionFlag::from_byte(self.file.record_data_buffer.get_ref()[0]);
 
         Ok(deletion_flag == DeletionFlag::Deleted)
     }
 
+    /// Reads the record
     pub fn read(&mut self) -> Result<crate::Record, Error> {
         self.read_as()
     }
 
+    /// Reads the record as the given type
     pub fn read_as<R>(&mut self) -> Result<R, Error>
     where
         R: ReadableRecord,
     {
-        // self.seek_to_beginning()
-        //     .map_err(|error| Error::new(error, self.index.0))?;
-
         self.file
             .record_data_buffer
             .set_position(DELETION_FLAG_SIZE as u64);
-        let mut field_iterator = FieldIterator::<_, Cursor<Vec<u8>>> {
+        let mut field_iterator = FieldIterator {
             source: &mut self.file.record_data_buffer,
             fields_info: self.file.fields_info.iter().peekable(),
-            memo_reader: &mut None,
+            memo_reader: &mut self.file.memo_reader,
             field_data_buffer: &mut self.file.field_data_buffer,
             encoding: &self.file.encoding,
             options: self.file.options,
@@ -373,13 +363,6 @@ where
             self.current_record.0 += 1
         }
         record_ref
-        // if self.current_record.0 >= self.file.header.num_records as usize {
-        //     None
-        // } else {
-        //     self.current_record.0 += 1;
-        //     self.file.record(self.current_record.0)
-        //         .expect("internal error tried to get out of bound record")
-        // }
     }
 }
 
@@ -424,24 +407,30 @@ where
 /// ```
 pub struct File<T> {
     pub(crate) inner: T,
+    memo_reader: Option<MemoReader<T>>,
     pub(crate) header: Header,
-    pub(crate) fields_info: Vec<FieldInfo>,
+    pub(crate) fields_info: FieldsInfo,
     pub(crate) encoding: DynEncoding,
+    /// Buffer that contains a whole record worth of data
+    /// It also contains the deletion flag
     record_data_buffer: Cursor<Vec<u8>>,
     /// Non-Memo field length is stored on a u8,
     /// so fields cannot exceed 255 bytes
     field_data_buffer: [u8; 255],
     pub(crate) options: ReadingOptions,
+    /// We track the position in the file
+    /// to avoid calling `seek` when we are reading buffer
+    /// in order (0, 1, 2, etc)
     file_position: u64,
 }
 
 impl<T> File<T> {
     /// Returns the information about fields present in the records
     pub fn fields(&self) -> &[FieldInfo] {
-        self.fields_info.as_slice()
+        self.fields_info.as_ref()
     }
 
-    /// Returns the field infex that corresponds to the given name
+    /// Returns the field index that corresponds to the given name
     pub fn field_index(&self, name: &str) -> Option<FieldIndex> {
         self.fields_info
             .iter()
@@ -460,7 +449,7 @@ impl<T> File<T> {
 }
 
 impl<T: Read + Seek> File<T> {
-    /// creates of File using source as the storate space.
+    /// creates of File using source as the storage space.
     pub fn open(mut source: T) -> Result<Self, Error> {
         let header = Header::read_from(&mut source).map_err(|error| Error::io_error(error, 0))?;
 
@@ -475,15 +464,12 @@ impl<T: Read + Seek> File<T> {
         let num_fields =
             (offset as usize - Header::SIZE - std::mem::size_of::<u8>()) / FieldInfo::SIZE;
 
-        let mut fields_info = Vec::<FieldInfo>::with_capacity(num_fields as usize);
-        for _ in 0..num_fields {
-            let info = FieldInfo::read_from(&mut source).map_err(|error| Error {
+        let fields_info =
+            FieldsInfo::read_from(&mut source, num_fields).map_err(|error| Error {
                 record_num: 0,
                 field: None,
                 kind: error,
             })?;
-            fields_info.push(info);
-        }
 
         let terminator = source
             .read_u8()
@@ -500,15 +486,13 @@ impl<T: Read + Seek> File<T> {
             Error::new(field_error, 0)
         })?;
 
-        let record_size: usize = DELETION_FLAG_SIZE
-            + fields_info
-                .iter()
-                .map(|i| i.field_length as usize)
-                .sum::<usize>();
+        let record_size: usize = DELETION_FLAG_SIZE + fields_info.size_of_all_fields();
         let record_data_buffer = Cursor::new(vec![0u8; record_size]);
+        // debug_assert_eq!(record_size - DELETION_FLAG_SIZE, header.size_of_record as usize);
+
         Ok(Self {
             inner: source,
-            // memo_reader: None,
+            memo_reader: None,
             header,
             fields_info,
             encoding,
@@ -578,8 +562,11 @@ impl<T: Write + Seek> File<T> {
         debug_assert_eq!(file_position, dst.stream_position().unwrap());
         Ok(Self {
             inner: dst,
+            memo_reader: None,
             header: table_info.header,
-            fields_info: table_info.fields_info,
+            fields_info: FieldsInfo {
+                inner: table_info.fields_info,
+            },
             encoding: table_info.encoding,
             record_data_buffer,
             field_data_buffer: [0u8; 255],
@@ -664,9 +651,31 @@ impl File<BufReadWriteFile> {
 
     /// Opens an existing dBase file in read only mode
     pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
-        let file = std::fs::File::open(path).map_err(|error| Error::io_error(error, 0))?;
+        let file = std::fs::File::open(path.as_ref()).map_err(|error| Error::io_error(error, 0))?;
 
-        File::open(BufReadWriteFile::new(file).unwrap())
+        let mut file = File::open(BufReadWriteFile::new(file).unwrap())?;
+        if file.fields_info.at_least_one_field_is_memo() {
+            let p = path.as_ref();
+            let memo_type = file.header.file_type.supported_memo_type();
+            if let Some(mt) = memo_type {
+                let memo_path = p.with_extension(mt.extension());
+
+                let memo_file = std::fs::File::open(memo_path).map_err(|error| Error {
+                    record_num: 0,
+                    field: None,
+                    kind: ErrorKind::ErrorOpeningMemoFile(error),
+                })?;
+
+                let memo_reader =
+                    BufReadWriteFile::new(memo_file)
+                        .and_then(|memo_file| {
+                            MemoReader::new(mt, memo_file)
+                        }).map_err(|error| Error::io_error(error, 0))?;
+
+                file.memo_reader = Some(memo_reader);
+            }
+        }
+        Ok(file)
     }
 
     /// Opens an existing dBase file in write only mode

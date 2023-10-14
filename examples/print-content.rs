@@ -40,7 +40,7 @@ fn main() {
         };
         // println!("time to read one record: {:?}", tt.elapsed());
 
-        for i in 0..num_fields {
+        for i in 0..2 {
             records.push(record.field(dbase::FieldIndex(i)).unwrap().read());
         }
     }

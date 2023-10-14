@@ -152,7 +152,7 @@ impl<T: Read + Seek, E: Encoding + 'static> ReaderBuilder<T, E> {
             source: file.inner,
             memo_reader,
             header: file.header,
-            fields_info: file.fields_info,
+            fields_info: file.fields_info.inner,
             encoding: self
                 .encoding
                 .map_or_else(|| file.encoding, DynEncoding::new),
@@ -208,7 +208,7 @@ impl<T: Read + Seek> Reader<T> {
             source: file.inner,
             memo_reader: None,
             header: file.header,
-            fields_info: file.fields_info,
+            fields_info: file.fields_info.inner,
             encoding: file.encoding,
             options: ReadingOptions::default(),
         })
